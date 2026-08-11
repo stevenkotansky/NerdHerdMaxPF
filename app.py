@@ -37,6 +37,15 @@ SLOT_MAP = {
 }
 BENCH_SLOTS = {20, 21, 22, 24, 25}  # slots that don't count toward a starting lineup
 
+# --- League sidebar: current champion + marriage tracker ---
+CURRENT_CHAMPION = "Steven Kotansky"
+MARRIAGE_STATUS = {
+    "justin shaw": ("Justin Shaw", "First Married"),
+    "steven kotansky": ("Steven Kotansky", "Second Married"),
+    "jackson selby": ("Jackson Selby", "Engaged"),
+}
+
+
 # ESPN player "position id" -> label, used as a fallback for eligibleSlots
 PRO_POS_MAP = {
     0: "QB", 1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "D/ST",
@@ -131,6 +140,53 @@ def get_current_week(data):
         or data.get("scoringPeriodId")
         or 1
     )
+
+
+def get_member_names(data):
+    """League members' display names, from the league response's 'members' list."""
+    names = []
+    for m in data.get("members", []):
+        name = (m.get("displayName") or "").strip()
+        if not name:
+            name = f"{m.get('firstName', '')} {m.get('lastName', '')}".strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def build_sidebar(data):
+    """Current champion + marriage tracker, with 'other' names pulled live
+    from this league's member list (so it's not hardcoded to one league)."""
+    member_names = get_member_names(data)
+
+    tracker = {"First Married": None, "Second Married": None, "Engaged": None}
+    matched_keys = set()
+    others = []
+
+    for name in member_names:
+        key = name.strip().lower()
+        if key in MARRIAGE_STATUS:
+            canonical_name, status = MARRIAGE_STATUS[key]
+            tracker[status] = canonical_name
+            matched_keys.add(key)
+        else:
+            others.append(name)
+
+    # Include any of the three special names even if they weren't found among
+    # this league's members (e.g. testing against a league they're not in).
+    for key, (canonical_name, status) in MARRIAGE_STATUS.items():
+        if key not in matched_keys and tracker[status] is None:
+            tracker[status] = canonical_name
+
+    return {
+        "current_champion": CURRENT_CHAMPION,
+        "marriage_tracker": {
+            "first_married": tracker["First Married"],
+            "second_married": tracker["Second Married"],
+            "engaged": tracker["Engaged"],
+            "other": others,
+        },
+    }
 
 
 def team_display_name(team):
@@ -231,6 +287,7 @@ def compute_league(league_id, year, week, espn_s2=None, swid=None):
         "week": week,
         "league_name": data.get("settings", {}).get("name", ""),
         "results": results,
+        "sidebar": build_sidebar(data),
     }
 
 
@@ -321,6 +378,7 @@ def compute_season_projection(league_id, year, espn_s2=None, swid=None, final_we
         "final_week": final_week,
         "final_week_auto_detected": final_week_override is None,
         "results": results,
+        "sidebar": build_sidebar(base),
     }
 
 
@@ -419,7 +477,30 @@ PAGE = """
     color: var(--text);
     padding: 24px 16px 64px;
   }
-  .wrap { max-width: 900px; margin: 0 auto; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  .layout { display: grid; grid-template-columns: 1fr; gap: 20px; }
+  @media (min-width: 860px) {
+    .layout { grid-template-columns: minmax(0, 1fr) 280px; align-items: start; }
+  }
+  .sidebar { display: flex; flex-direction: column; gap: 16px; }
+  .sidebar .card { margin-bottom: 0; }
+  .sidebar h2 { font-size: 0.78rem; text-transform: uppercase; letter-spacing: .04em;
+                color: var(--muted); margin: 0 0 12px; }
+  .champion-name { font-size: 1.15rem; font-weight: 700; color: var(--accent); }
+  .champion-sub { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+  .mtable { width: 100%; border-collapse: collapse; }
+  .mtable td { padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
+  .mtable tr:last-child td { border-bottom: none; }
+  .mtable td.mlabel { color: var(--muted); font-size: 0.72rem; text-transform: uppercase;
+                       letter-spacing: .03em; width: 44%; }
+  .mtable td.mname { font-weight: 600; text-align: right; }
+  .others-block { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .others-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: .03em;
+                   color: var(--muted); margin-bottom: 8px; }
+  .others-list { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: #1d222b; border: 1px solid var(--border); border-radius: 20px;
+          padding: 4px 10px; font-size: 0.78rem; }
+  .placeholder { color: var(--muted); font-size: 0.8rem; font-style: italic; }
   h1 { font-size: 1.4rem; margin: 0 0 4px; }
   .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 24px; }
   .card {
@@ -489,6 +570,9 @@ PAGE = """
 <div class="wrap">
   <h1>Max PF &amp; Inverse Draft Order</h1>
   <div class="sub">Enter a public ESPN fantasy football league and see each team's optimal-lineup ceiling — bench and IR players included.</div>
+
+<div class="layout">
+<div class="main">
 
   <div class="tabs">
     <div class="tab active" id="tab-week" onclick="setMode('week')">Single Week</div>
@@ -562,6 +646,33 @@ PAGE = """
       <tbody id="resultsBody"></tbody>
     </table>
   </div>
+
+</div>
+
+<aside class="sidebar">
+  <div class="card">
+    <h2>Current Champion</h2>
+    <div class="champion-name">Steven Kotansky</div>
+    <div class="champion-sub">Reigning league champ</div>
+  </div>
+
+  <div class="card">
+    <h2>Marriage Tracker</h2>
+    <table class="mtable">
+      <tr><td class="mlabel">First Married</td><td class="mname">Justin Shaw</td></tr>
+      <tr><td class="mlabel">Second Married</td><td class="mname">Steven Kotansky</td></tr>
+      <tr><td class="mlabel">Engaged</td><td class="mname">Jackson Selby</td></tr>
+    </table>
+    <div class="others-block">
+      <div class="others-label">Other</div>
+      <div class="others-list" id="othersList">
+        <span class="placeholder">Run a lookup to load the rest of the league's members.</span>
+      </div>
+    </div>
+  </div>
+</aside>
+</div>
+
 </div>
 
 <script>
@@ -717,6 +828,7 @@ function renderResults(data) {
   });
 
   document.getElementById('resultsCard').style.display = 'block';
+  updateSidebar(data.sidebar);
 }
 
 function renderSeasonResults(data) {
@@ -767,6 +879,18 @@ function renderSeasonResults(data) {
   });
 
   document.getElementById('resultsCard').style.display = 'block';
+  updateSidebar(data.sidebar);
+}
+
+function updateSidebar(sidebar) {
+  if (!sidebar) return;
+  const list = document.getElementById('othersList');
+  const others = sidebar.marriage_tracker && sidebar.marriage_tracker.other || [];
+  if (others.length === 0) {
+    list.innerHTML = '<span class="placeholder">No other league members found.</span>';
+    return;
+  }
+  list.innerHTML = others.map(name => `<span class="chip">${name}</span>`).join('');
 }
 
 function toggleLineup(id) {
