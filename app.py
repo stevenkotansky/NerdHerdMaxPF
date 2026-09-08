@@ -395,6 +395,133 @@ def _roster_entries(team, week, source_id):
     return entries
 
 
+def build_good_faith_report(team, week, slot_counts, threshold, source_id=1):
+    """
+    Amendment VIII compliance check for one team/week.
+
+    Compares the lineup the manager currently has started against the
+    mathematically optimal lineup available from their full roster
+    (bench + IR included), and flags specific starter-vs-bench swaps
+    where a benched, slot-eligible player is projected to score
+    meaningfully more than who's started.
+
+    source_id=1 (default) -> ESPN's own weekly projections. This is what
+    makes the check useful BEFORE kickoff: it flags a bad lineup while
+    there's still time for the manager to fix it, instead of only telling
+    them after the fact. source_id=0 -> actual scored points, for
+    retroactively checking a week that's already been played.
+
+    This is a heuristic aid for the Commissioner, NOT a ruling. Amendment
+    VIII explicitly reserves the good-faith / "reasonable person" call to
+    the Commissioner, who weighs context this tool can't see (byes,
+    international games, weddings, last-minute injuries, etc).
+    """
+    raw_entries = team.get("roster", {}).get("entries", [])
+    full = []
+    for re in raw_entries:
+        ppe = re.get("playerPoolEntry", {})
+        player = ppe.get("player", {})
+        pts = player_week_points(player, week, source_id=source_id)
+        eligible = set(player.get("eligibleSlots", []))
+        name = player.get("fullName", "Unknown Player")
+        current_slot = re.get("lineupSlotId")
+        full.append({
+            "name": name,
+            "points": pts,
+            "eligible_slots": eligible,
+            "current_slot": current_slot,
+            "current_slot_label": SLOT_MAP.get(current_slot, f"SLOT{current_slot}"),
+            "started": current_slot is not None and current_slot not in BENCH_SLOTS,
+        })
+
+    entries_for_opt = [
+        {"name": p["name"], "points": p["points"], "eligible_slots": p["eligible_slots"]}
+        for p in full
+    ]
+    max_pf, optimal_lineup = compute_max_pf(entries_for_opt, slot_counts, week)
+
+    starters = [p for p in full if p["started"]]
+    bench = [p for p in full if not p["started"]]
+    started_pf = round(sum(p["points"] for p in starters), 2)
+    points_left = round(max_pf - started_pf, 2)
+
+    # Localize specific bad swaps: for each starter, is there a
+    # slot-eligible benched player clearly projected/scored to outscore them?
+    flags = []
+    for s in starters:
+        slot_id = s["current_slot"]
+        candidates = [b for b in bench if slot_id in b["eligible_slots"]]
+        if not candidates:
+            continue
+        best_alt = max(candidates, key=lambda b: b["points"])
+        diff = best_alt["points"] - s["points"]
+        if diff >= threshold:
+            flags.append({
+                "slot": s["current_slot_label"],
+                "started_player": s["name"],
+                "started_points": round(s["points"], 2),
+                "benched_player": best_alt["name"],
+                "benched_points": round(best_alt["points"], 2),
+                "diff": round(diff, 2),
+            })
+    flags.sort(key=lambda f: -f["diff"])
+
+    is_flagged = points_left >= threshold or len(flags) > 0
+
+    return {
+        "team": team_display_name(team),
+        "team_id": team.get("id"),
+        "started_pf": started_pf,
+        "max_pf": max_pf,
+        "points_left_on_bench": points_left,
+        "flagged": is_flagged,
+        "flags": flags,
+        "starters": [
+            {"slot": s["current_slot_label"], "name": s["name"], "points": round(s["points"], 2)}
+            for s in sorted(starters, key=lambda x: -x["points"])
+        ],
+        "bench": [
+            {"name": b["name"], "points": round(b["points"], 2)}
+            for b in sorted(bench, key=lambda x: -x["points"])
+        ],
+        "optimal_lineup": optimal_lineup,
+    }
+
+
+def compute_good_faith(league_id, year, week, espn_s2=None, swid=None, threshold=5.0, basis="projected"):
+    source_id = 1 if basis == "projected" else 0
+    data = fetch_league(league_id, year, week, espn_s2, swid)
+    slot_counts = get_lineup_slot_counts(data)
+    if not slot_counts:
+        raise ValueError("Could not read starting lineup slots from league settings.")
+
+    teams = data.get("teams", [])
+    results = [build_good_faith_report(team, week, slot_counts, threshold, source_id=source_id) for team in teams]
+
+    # Worst offenders (most points left on the bench) first.
+    results.sort(key=lambda r: r["points_left_on_bench"], reverse=True)
+
+    # If every team's Max PF is 0, ESPN has no stats of this type for this
+    # week yet -- e.g. no projections published yet (rare, usually shows up
+    # very far in advance) or, for the "actual" basis, games haven't been
+    # played/finalized. Flag this explicitly instead of silently showing an
+    # all-zero, all-"good faith" table.
+    no_stats_available = len(results) > 0 and all(r["max_pf"] == 0 for r in results)
+
+    return {
+        "league_id": league_id,
+        "year": year,
+        "week": week,
+        "threshold": threshold,
+        "basis": basis,
+        "league_name": data.get("settings", {}).get("name", ""),
+        "flagged_count": sum(1 for r in results if r["flagged"]),
+        "no_stats_available": no_stats_available,
+        "results": results,
+        "sidebar": build_sidebar(data),
+    }
+
+
 @app.route("/")
 def index():
     return render_template_string(PAGE)
@@ -452,6 +579,38 @@ def api_project():
         return jsonify({"error": f"Network error reaching ESPN: {e}"}), 502
 
 
+@app.route("/api/goodfaith")
+def api_goodfaith():
+    league_id = request.args.get("leagueId", "").strip()
+    year = request.args.get("year", "").strip()
+    week = request.args.get("week", "").strip()
+    threshold_raw = request.args.get("threshold", "").strip()
+    basis = request.args.get("basis", "projected").strip().lower()
+    espn_s2 = request.args.get("espn_s2", "").strip() or None
+    swid = request.args.get("swid", "").strip() or None
+
+    if not league_id or not year or not week:
+        return jsonify({"error": "leagueId, year, and week are all required."}), 400
+
+    if basis not in ("projected", "actual"):
+        return jsonify({"error": "basis must be 'projected' or 'actual'."}), 400
+
+    try:
+        year = int(year)
+        week = int(week)
+        threshold = float(threshold_raw) if threshold_raw else 5.0
+    except ValueError:
+        return jsonify({"error": "year and week must be integers, threshold must be a number."}), 400
+
+    try:
+        result = compute_good_faith(league_id, year, week, espn_s2, swid, threshold, basis)
+        return jsonify(result)
+    except (PermissionError, LookupError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
+    except requests.RequestException as e:
+        return jsonify({"error": f"Network error reaching ESPN: {e}"}), 502
+
+
 PAGE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -468,6 +627,9 @@ PAGE = """
     --muted: #8b93a1;
     --accent: #ff6a3d;
     --accent2: #2dd4bf;
+    --bad: #ff5470;
+    --bad-bg: #2a141c;
+    --good: #4ade80;
   }
   * { box-sizing: border-box; }
   body {
@@ -544,6 +706,8 @@ PAGE = """
   th { color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: .03em; }
   tr.team-row { cursor: pointer; }
   tr.team-row:hover { background: #1d222b; }
+  tr.team-row.flagged-row { background: var(--bad-bg); }
+  tr.team-row.flagged-row:hover { background: #351a24; }
   .pick { display: inline-block; background: var(--accent); color: #1a1a1a; font-weight: 700;
           border-radius: 6px; min-width: 24px; text-align: center; padding: 2px 6px; font-size: 0.8rem; }
   .maxpf { color: var(--accent2); font-weight: 700; }
@@ -564,6 +728,33 @@ PAGE = """
   .mode-panel { display: none; }
   .mode-panel.active { display: block; }
   .note { font-size: 0.8rem; color: var(--muted); margin-top: 10px; line-height: 1.4; }
+  .badge {
+    display: inline-block; border-radius: 6px; padding: 3px 9px; font-size: 0.72rem;
+    font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
+  }
+  .badge-flagged { background: var(--bad); color: #1a1a1a; }
+  .badge-ok { background: #1d222b; color: var(--good); border: 1px solid var(--border); }
+  .gf-summary {
+    display: flex; justify-content: space-between; align-items: baseline;
+    flex-wrap: wrap; gap: 8px; margin-bottom: 4px;
+  }
+  .gf-summary .count { color: var(--bad); font-weight: 700; }
+  .amend-note {
+    background: #12151b; border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 12px 14px; font-size: 0.82rem; color: var(--muted);
+    line-height: 1.5; margin-bottom: 18px;
+  }
+  .amend-note strong { color: var(--text); }
+  .split { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  @media (min-width: 640px) { .split { grid-template-columns: 1fr 1fr; } }
+  .split h4 { margin: 0 0 6px; font-size: 0.75rem; text-transform: uppercase;
+              letter-spacing: .03em; color: var(--muted); }
+  .flag-item {
+    background: var(--bad-bg); border: 1px solid #472430; border-radius: 8px;
+    padding: 10px 12px; margin-top: 8px; font-size: 0.85rem;
+  }
+  .flag-item .diff { color: var(--bad); font-weight: 700; }
+  .no-flags { color: var(--good); font-size: 0.85rem; padding: 8px 0; }
 </style>
 </head>
 <body>
@@ -577,6 +768,7 @@ PAGE = """
   <div class="tabs">
     <div class="tab active" id="tab-week" onclick="setMode('week')">Single Week</div>
     <div class="tab" id="tab-season" onclick="setMode('season')">Season Projection</div>
+    <div class="tab" id="tab-goodfaith" onclick="setMode('goodfaith')">Good Faith Check</div>
   </div>
 
   <div class="card">
@@ -584,7 +776,7 @@ PAGE = """
       <div class="row">
         <div class="field">
           <label for="leagueId">League ID</label>
-          <input id="leagueId" placeholder="e.g. 123456" inputmode="numeric">
+          <input id="leagueId" placeholder="e.g. 123456" inputmode="numeric" value="89078444">
         </div>
         <div class="field">
           <label for="year">Season</label>
@@ -601,7 +793,7 @@ PAGE = """
       <div class="row">
         <div class="field">
           <label for="leagueIdS">League ID</label>
-          <input id="leagueIdS" placeholder="e.g. 123456" inputmode="numeric">
+          <input id="leagueIdS" placeholder="e.g. 123456" inputmode="numeric" value="89078444">
         </div>
         <div class="field">
           <label for="yearS">Season</label>
@@ -618,6 +810,57 @@ PAGE = """
         regular season. "Final week" auto-detects from your league's settings — override it if the
         guess looks wrong (playoff-only leagues can be tricky to detect).
       </div>
+    </div>
+
+    <div class="mode-panel" id="panel-goodfaith">
+      <div class="amend-note">
+        <strong>Amendment VIII — Good Faith Lineup Check.</strong> Checks each team's
+        <em>currently set</em> lineup against ESPN's own weekly projections and flags a
+        projected bad lineup <strong>before kickoff</strong>, so a manager still has time to fix
+        it. It calls out the specific starter/bench swaps behind each flag. This is a
+        <strong>flagging tool, not a ruling</strong> — Amendment VIII reserves the "reasonable
+        person" good-faith determination to the Commissioner, who can weigh context this tool
+        can't see (byes, players abroad, weddings, last-minute injuries, etc). Only egregious,
+        week-level violations are penalized under the Constitution.
+      </div>
+      <div class="row">
+        <div class="field">
+          <label for="leagueIdG">League ID</label>
+          <input id="leagueIdG" placeholder="e.g. 123456" inputmode="numeric" value="89078444">
+        </div>
+        <div class="field">
+          <label for="yearG">Season</label>
+          <input id="yearG" placeholder="2026" inputmode="numeric" value="2026">
+        </div>
+        <div class="field">
+          <label for="weekG">Week</label>
+          <input id="weekG" placeholder="current week" inputmode="numeric">
+        </div>
+        <div class="field">
+          <label for="threshold">Flag threshold (pts)</label>
+          <input id="threshold" placeholder="10" inputmode="numeric" value="5">
+        </div>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <div class="field">
+          <label for="basisG">Check basis</label>
+          <select id="basisG" style="background:#0c0e12;border:1px solid var(--border);
+                  border-radius:8px;padding:10px 12px;color:var(--text);font-size:0.95rem;">
+            <option value="projected" selected>Projected (before kickoff)</option>
+            <option value="actual">Actual (after games are played)</option>
+          </select>
+        </div>
+      </div>
+      <div class="note">
+        "Week" defaults to the league's current week if left blank. <strong>Projected</strong>
+        uses ESPN's weekly projections against each team's lineup as it's set <em>right now</em>
+        — this is what catches a bad lineup while there's still time to fix it. Switch to
+        <strong>Actual</strong> to instead grade what really happened after the week is over.
+        "Flag threshold" is the point gap (bench points left, or a single starter/bench swap)
+        that counts as egregious enough to flag — raise it to only surface the most obvious
+        cases, lower it to see everything.
+      </div>
+
     </div>
 
     <details>
@@ -682,15 +925,19 @@ function setMode(m) {
   mode = m;
   document.getElementById('tab-week').classList.toggle('active', m === 'week');
   document.getElementById('tab-season').classList.toggle('active', m === 'season');
+  document.getElementById('tab-goodfaith').classList.toggle('active', m === 'goodfaith');
   document.getElementById('panel-week').classList.toggle('active', m === 'week');
   document.getElementById('panel-season').classList.toggle('active', m === 'season');
+  document.getElementById('panel-goodfaith').classList.toggle('active', m === 'goodfaith');
   document.getElementById('resultsCard').style.display = 'none';
   document.getElementById('error').style.display = 'none';
   document.getElementById('status').textContent = '';
 }
 
 async function run() {
-  if (mode === 'week') { await runWeek(); } else { await runSeason(); }
+  if (mode === 'week') { await runWeek(); }
+  else if (mode === 'season') { await runSeason(); }
+  else { await runGoodFaith(); }
 }
 
 async function runWeek() {
@@ -772,6 +1019,69 @@ async function runSeason() {
       throw new Error(data.error || 'Something went wrong.');
     }
     renderSeasonResults(data);
+    status.textContent = 'Done.';
+  } catch (e) {
+    errorEl.textContent = e.message;
+    errorEl.style.display = 'block';
+    status.textContent = '';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function runGoodFaith() {
+  const leagueId = document.getElementById('leagueIdG').value.trim();
+  const year = document.getElementById('yearG').value.trim();
+  const week = document.getElementById('weekG').value.trim();
+  const threshold = document.getElementById('threshold').value.trim();
+  const basis = document.getElementById('basisG').value;
+  const espn_s2 = document.getElementById('espn_s2').value.trim();
+  const swid = document.getElementById('swid').value.trim();
+  const btn = document.getElementById('runBtn');
+  const status = document.getElementById('status');
+  const errorEl = document.getElementById('error');
+  const resultsCard = document.getElementById('resultsCard');
+
+  errorEl.style.display = 'none';
+  resultsCard.style.display = 'none';
+
+  if (!leagueId || !year) {
+    errorEl.textContent = 'League ID and season are required.';
+    errorEl.style.display = 'block';
+    return;
+  }
+
+  let effectiveWeek = week;
+  btn.disabled = true;
+
+  try {
+    if (!effectiveWeek) {
+      status.textContent = 'Detecting current week...';
+      const cwParams = new URLSearchParams({ leagueId, year });
+      if (espn_s2) cwParams.set('espn_s2', espn_s2);
+      if (swid) cwParams.set('swid', swid);
+      const cwResp = await fetch('/api/project?' + cwParams.toString());
+      const cwData = await cwResp.json();
+      if (!cwResp.ok) throw new Error(cwData.error || 'Could not detect current week.');
+      effectiveWeek = cwData.current_week;
+      document.getElementById('weekG').value = effectiveWeek;
+    }
+
+    status.textContent = basis === 'projected'
+      ? 'Fetching current rosters and checking projected lineups for good faith...'
+      : 'Fetching rosters and checking actual lineups for good faith...';
+
+    const params = new URLSearchParams({ leagueId, year, week: effectiveWeek, basis });
+    if (threshold) params.set('threshold', threshold);
+    if (espn_s2) params.set('espn_s2', espn_s2);
+    if (swid) params.set('swid', swid);
+
+    const resp = await fetch('/api/goodfaith?' + params.toString());
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || 'Something went wrong.');
+    }
+    renderGoodFaithResults(data);
     status.textContent = 'Done.';
   } catch (e) {
     errorEl.textContent = e.message;
@@ -872,6 +1182,108 @@ function renderSeasonResults(data) {
             <thead><tr><th>Week</th><th>Type</th><th>Max PF</th></tr></thead>
             <tbody>${weekRows}</tbody>
           </table>
+        </div>
+      </td>
+    `;
+    body.appendChild(panelTr);
+  });
+
+  document.getElementById('resultsCard').style.display = 'block';
+  updateSidebar(data.sidebar);
+}
+
+function renderGoodFaithResults(data) {
+  const basisLabel = data.basis === 'actual' ? 'Actual' : 'Projected';
+  document.getElementById('leagueName').textContent =
+    (data.league_name || ('League ' + data.league_id)) + ' — Week ' + data.week + ', ' + data.year +
+    ' — Good Faith Check (' + basisLabel + ')';
+
+  const flaggedCount = data.flagged_count || 0;
+
+  if (data.no_stats_available) {
+    const reason = data.basis === 'actual'
+      ? `ESPN hasn't scored this week's games yet (they haven't been played, or stats haven't finalized).`
+      : `ESPN hasn't published projections for this week yet.`;
+    document.getElementById('resultsHint').innerHTML =
+      `<div class="gf-summary" style="color:var(--bad);">
+         <span>⚠ Every team shows 0 points for Week ${data.week}. This almost always means
+         ${reason} It's not a bug in the tool — rosters can be fully "set" and still show 0
+         points until that data exists. Try again later, or check a week you know has data to confirm.</span>
+       </div>`;
+  } else {
+    document.getElementById('resultsHint').innerHTML =
+      `<div class="gf-summary">
+         <span>${basisLabel} basis · flag threshold: ${data.threshold} pts. Tap a team row for its full roster breakdown.</span>
+         <span class="count">${flaggedCount} team${flaggedCount === 1 ? '' : 's'} flagged this week</span>
+       </div>`;
+  }
+
+  document.getElementById('resultsHead').innerHTML = `
+    <tr><th>Team</th><th>${basisLabel} PF</th><th>${basisLabel} Max PF</th><th>Left on bench</th><th>Status</th></tr>
+  `;
+
+  const body = document.getElementById('resultsBody');
+  body.innerHTML = '';
+
+  data.results.forEach((r, idx) => {
+    const rowId = 'lineup-' + idx;
+    const tr = document.createElement('tr');
+    tr.className = 'team-row' + (r.flagged ? ' flagged-row' : '');
+    tr.onclick = () => toggleLineup(rowId);
+    const statusBadge = r.flagged
+      ? '<span class="badge badge-flagged">Flagged</span>'
+      : '<span class="badge badge-ok">Good faith</span>';
+    tr.innerHTML = `
+      <td>${r.team}</td>
+      <td>${r.started_pf}</td>
+      <td class="maxpf">${r.max_pf}</td>
+      <td class="left">+${r.points_left_on_bench}</td>
+      <td>${statusBadge}</td>
+    `;
+    body.appendChild(tr);
+
+    const panelTr = document.createElement('tr');
+    panelTr.className = 'lineup-panel';
+    panelTr.id = rowId;
+
+    const flagsHtml = r.flags.length > 0
+      ? r.flags.map(f => `
+          <div class="flag-item">
+            Started <strong>${f.started_player}</strong> (${f.started_points} pts) at ${f.slot}
+            over benched, slot-eligible <strong>${f.benched_player}</strong> (${f.benched_points} pts)
+            — <span class="diff">+${f.diff} pts left on the table</span>
+          </div>
+        `).join('')
+      : '<div class="no-flags">No individual starter/bench swap crossed the flag threshold.</div>';
+
+    const starterRows = r.starters.map(p =>
+      `<tr><td>${p.slot}</td><td>${p.name}</td><td>${p.points}</td></tr>`
+    ).join('');
+    const benchRows = r.bench.map(p =>
+      `<tr><td>${p.name}</td><td>${p.points}</td></tr>`
+    ).join('');
+
+    panelTr.innerHTML = `
+      <td colspan="5">
+        <div class="lineup-inner">
+          <div class="split">
+            <div>
+              <h4>Started lineup</h4>
+              <table>
+                <thead><tr><th>Slot</th><th>Player</th><th>Points</th></tr></thead>
+                <tbody>${starterRows}</tbody>
+              </table>
+            </div>
+            <div>
+              <h4>Bench / IR (unused)</h4>
+              <table>
+                <thead><tr><th>Player</th><th>Points</th></tr></thead>
+                <tbody>${benchRows}</tbody>
+              </table>
+            </div>
+          </div>
+          <h4 style="margin-top:16px;">Flagged swaps</h4>
+          ${flagsHtml}
         </div>
       </td>
     `;
